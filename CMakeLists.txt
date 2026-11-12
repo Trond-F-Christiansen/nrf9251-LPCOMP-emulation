@@ -11,4 +11,4 @@ project(esig)
 
 target_sources(app PRIVATE src/main.c)
 
-add_subdirectory(src/saadc)
+add_subdirectory(src/saadc_limit)
