@@ -17,6 +17,14 @@
  * overwriting the same sample without any interrupt. Only the LIMITH and LIMITL events raise an
  * interrupt, and the ISR reads and prints the sample that is in the buffer at that time.
  *
+ * The comparator output is a GPIO driven without the CPU:
+ *
+ *   SAADC LIMITH --(DPPI)--> GPIOTE130 TASKS_SET[ch]  (output high, input above threshold)
+ *   SAADC LIMITL --(DPPI)--> GPIOTE130 TASKS_CLR[ch]  (output low, input below threshold)
+ *
+ * The output keeps its level while the input is inside the hysteresis band, since neither limit
+ * event is generated there.
+ *
  * The limits are re-armed from the ISR so that the module behaves like a comparator (LPCOMP):
  * an interrupt is raised only when the input crosses the threshold, not while it stays on one
  * side. While the input is below, only LIMITH (threshold + hysteresis/2) is armed. While it is
@@ -35,6 +43,8 @@
 #include <zephyr/sys/atomic.h>
 #include <nrfx_saadc.h>
 #include <nrfx_rtc.h>
+#include <nrfx_gpiote.h>
+#include <gpiote_nrfx.h>
 #include <helpers/nrfx_gppi.h>
 #include <dmm.h>
 
@@ -46,6 +56,10 @@ LOG_MODULE_REGISTER(saadc_limit, CONFIG_SAADC_LIMIT_LOG_LEVEL);
 /* SAADC pin from datasheet gpio maping, NRFX_ANALOG_EXTERNAL_AIN0-AIN7 = P1.0 - P1.7 */
 #define SAADC_EXTERNAL_AIN NRFX_ANALOG_EXTERNAL_AIN1
 #define SAADC_NODE DT_NODELABEL(adc)
+/* Comparator output pin, LED1 on the DK (P2.3, active high). Must not be the SAADC input pin. */
+#define OUTPUT_NODE DT_ALIAS(led1)
+#define OUTPUT_PIN NRF_DT_GPIOS_TO_PSEL(OUTPUT_NODE, gpios)
+#define GPIOTE_NODE DT_NODELABEL(_CONCAT(gpiote, NRF_DT_GPIOTE_INST(OUTPUT_NODE, gpios)))
 #define SAADC_CHANNEL 0
 #define SAADC_CHANNEL_MASK BIT(SAADC_CHANNEL)
 #define LIMIT_INT_MASK (NRF_SAADC_INT_CH0LIMITH | NRF_SAADC_INT_CH0LIMITL)
@@ -53,6 +67,9 @@ LOG_MODULE_REGISTER(saadc_limit, CONFIG_SAADC_LIMIT_LOG_LEVEL);
 
 static nrfx_rtc_t rtc = NRFX_RTC_INSTANCE(NRF_RTC130);
 static nrfx_gppi_handle_t gppi_handle;
+static nrfx_gppi_handle_t out_set_handle;
+static nrfx_gppi_handle_t out_clr_handle;
+static nrfx_gpiote_t *const gpiote = &GPIOTE_NRFX_INST_BY_NODE(GPIOTE_NODE);
 
 /* One sample, placed in the DMA-accessible RAM region of the adc node. Written by EasyDMA. */
 static nrf_saadc_value_t sample_buf DMM_MEMORY_SECTION(SAADC_NODE);
@@ -223,6 +240,15 @@ int saadc_limit_init(void)
 								      SAADC_CHANNEL);
 	nrfx_saadc_adv_config_t adv_config = NRFX_SAADC_DEFAULT_ADV_CONFIG;
 	nrfx_rtc_config_t rtc_cfg = NRFX_RTC_DEFAULT_CONFIG;
+	static const nrfx_gpiote_output_config_t output_config = {
+		.drive = NRF_GPIO_PIN_S0S1,
+		.input_connect = NRF_GPIO_PIN_INPUT_DISCONNECT,
+		.pull = NRF_GPIO_PIN_NOPULL,
+	};
+	nrfx_gpiote_task_config_t task_config = {
+		.polarity = NRF_GPIOTE_POLARITY_TOGGLE,
+		.init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
+	};
 
 	if (initialized) {
 		return -EALREADY;
@@ -293,6 +319,47 @@ int saadc_limit_init(void)
 
 	LOG_INF("RTC130 COMPARE0 -> SAADC SAMPLE and RTC CLEAR GPPI connection allocated");
 
+	/* The Zephyr GPIO driver initializes the GPIOTE instance, which is also used here. */
+	if (!nrfx_gpiote_init_check(gpiote)) {
+		LOG_ERR("GPIOTE instance not initialized");
+		return -ENODEV;
+	}
+
+	err = nrfx_gpiote_channel_alloc(gpiote, &task_config.task_ch);
+	if (err) {
+		LOG_ERR("nrfx_gpiote_channel_alloc, error: %d", err);
+		return -ENOMEM;
+	}
+
+	err = nrfx_gpiote_output_configure(gpiote, OUTPUT_PIN, &output_config, &task_config);
+	if (err) {
+		LOG_ERR("nrfx_gpiote_output_configure, error: %d", err);
+		return err;
+	}
+
+	nrfx_gpiote_out_task_enable(gpiote, OUTPUT_PIN);
+
+	/* LIMITH -> SET (output high), LIMITL -> CLR (output low). */
+	err = nrfx_gppi_conn_alloc(
+		nrf_saadc_event_address_get(NRF_SAADC, nrf_saadc_limit_event_get(
+			SAADC_CHANNEL, NRF_SAADC_LIMIT_HIGH)),
+		nrfx_gpiote_set_task_address_get(gpiote, OUTPUT_PIN), &out_set_handle);
+	if (err) {
+		LOG_ERR("nrfx_gppi_conn_alloc (LIMITH -> SET), error: %d", err);
+		return err;
+	}
+
+	err = nrfx_gppi_conn_alloc(
+		nrf_saadc_event_address_get(NRF_SAADC, nrf_saadc_limit_event_get(
+			SAADC_CHANNEL, NRF_SAADC_LIMIT_LOW)),
+		nrfx_gpiote_clr_task_address_get(gpiote, OUTPUT_PIN), &out_clr_handle);
+	if (err) {
+		LOG_ERR("nrfx_gppi_conn_alloc (LIMITL -> CLR), error: %d", err);
+		return err;
+	}
+
+	LOG_INF("SAADC LIMITH -> SET, LIMITL -> CLR on pin %d allocated", OUTPUT_PIN);
+
 	initialized = true;
 
 	return 0;
@@ -357,6 +424,10 @@ int saadc_limit_start(int16_t threshold, uint16_t hysteresis, uint32_t period_ms
 	}
 
 	atomic_set(&running, true);
+	/* The output is low until the first sample above the hysteresis band sets it. */
+	nrfx_gpiote_out_task_force(gpiote, OUTPUT_PIN, 0);
+	nrfx_gppi_conn_enable(out_set_handle);
+	nrfx_gppi_conn_enable(out_clr_handle);
 	nrfx_gppi_conn_enable(gppi_handle);
 	nrfx_rtc_counter_clear(&rtc);
 	nrfx_rtc_enable(&rtc);
@@ -388,6 +459,8 @@ void saadc_limit_stop(void)
 
 	nrfx_rtc_disable(&rtc);
 	nrfx_gppi_conn_disable(gppi_handle);
+	nrfx_gppi_conn_disable(out_set_handle);
+	nrfx_gppi_conn_disable(out_clr_handle);
 
 	nrf_saadc_int_set(NRF_SAADC, 0);
 	nrf_saadc_shorts_disable(NRF_SAADC, NRF_SAADC_SHORT_END_START_MASK);

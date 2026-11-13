@@ -21,6 +21,11 @@ controls it.
   - After start the state is unknown and both are armed. The first sample outside the hysteresis
     band sets the initial state.
 
+- The comparator output is LED1 (P2.3, active high), driven without the CPU: SAADC LIMITH
+  triggers the GPIOTE130 SET task (high) and LIMITL the CLR task (low), over DPPI. The level holds
+  while the input is inside the hysteresis band. It is driven low at `start` and set by the first
+  sample outside the band.
+
 ## Shell
 
 Values are raw 12-bit SAADC units.
